@@ -1,0 +1,151 @@
+on: push
+#  push:
+#    tags:
+#      - "v*"
+
+jobs:
+
+  build:
+    name: build
+    runs-on: macos-13
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+
+      - name: setup java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'adopt'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: import certs
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.CERTIFICATES_P12 }}
+          p12-password: ${{ secrets.CERTIFICATES_PASSWORD }}
+
+      - name: download provisioning profiles
+        uses: apple-actions/download-provisioning-profiles@v1
+        with:
+          bundle-id: ${{ secrets.BUNDLE_ID }}
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+
+      - name: build archive
+        working-directory: iosApp
+        env:
+          SCHEME: Kotlin_Bars
+          CONFIGURATION: Release
+          SDK: iphoneos
+        run: |
+          cat <<EOF > ../local.properties
+          barsUrl=https://${{ secrets.DOMAINS }}/api/bars
+          EOF
+          
+          # todo: this is duplicated in the build phase run script
+          #       because for some reason the file needs to be there before we run xcodebuild
+          cat <<EOF > Kotlin-Bars-Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+            <dict>
+              <key>BarsUrl</key>
+              <string>https://${{ secrets.DOMAINS }}/api/bars</string>
+              <key>ITSAppUsesNonExemptEncryption</key>
+              <false/>
+            </dict>
+          </plist>
+          EOF
+          
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            agvtool new-marketing-version ${GITHUB_REF_NAME#v}
+          fi
+          
+          xcrun agvtool new-version -all ${GITHUB_RUN_NUMBER}
+          
+          xcrun xcodebuild \
+            -scheme "${SCHEME}" \
+            -configuration "${CONFIGURATION}" \
+            -sdk "${SDK}" \
+            -parallelizeTargets \
+            -showBuildTimingSummary \
+            -disableAutomaticPackageResolution \
+            -derivedDataPath "${RUNNER_TEMP}/Build/DerivedData" \
+            -archivePath "${RUNNER_TEMP}/Build/Archives/${SCHEME}.xcarchive" \
+            -resultBundlePath "${RUNNER_TEMP}/Build/Artifacts/${SCHEME}.xcresult" \
+            -destination "generic/platform=iOS" \
+            DEVELOPMENT_TEAM="${{ secrets.APPSTORE_TEAM_ID }}" \
+            PRODUCT_BUNDLE_IDENTIFIER="${{ secrets.BUNDLE_ID }}" \
+            CODE_SIGN_STYLE="Manual" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ secrets.DEV_PROVISIONING_PROFILE_NAME }}" \
+            archive
+
+      - name: "Generate ExportOptions.plist"
+        run: |
+          cat <<EOF > ${RUNNER_TEMP}/Build/ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+            <dict>
+              <key>destination</key>
+              <string>export</string>
+              <key>method</key>
+              <string>app-store</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>generateAppStoreInformation</key>
+              <true/>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>teamID</key>
+              <string>${{ secrets.APPSTORE_TEAM_ID }}</string>
+              <key>uploadSymbols</key>
+              <true/>
+              <key>provisioningProfiles</key>
+              <dict>
+                <key>${{ secrets.BUNDLE_ID }}</key>
+                <string>${{ secrets.DIST_PROVISIONING_PROFILE_NAME }}</string>
+              </dict>
+            </dict>
+          </plist>
+          EOF
+
+      - id: export_archive
+        name: export archive
+        env:
+          SCHEME: Kotlin_Bars
+        run: |
+          xcrun xcodebuild \
+            -exportArchive \
+            -exportOptionsPlist "${RUNNER_TEMP}/Build/ExportOptions.plist" \
+            -archivePath "${RUNNER_TEMP}/Build/Archives/${SCHEME}.xcarchive" \
+            -exportPath "${RUNNER_TEMP}/Build/Archives/${SCHEME}.xcarchive/${SCHEME}.ipa" \
+            PRODUCT_BUNDLE_IDENTIFIER="${{ secrets.BUNDLE_ID }}"
+          
+          echo "ipa_path=${RUNNER_TEMP}/Build/Archives/${SCHEME}.xcarchive/${SCHEME}.ipa/${SCHEME}.ipa" >> $GITHUB_OUTPUT
+
+      - name: upload ipa
+        uses: actions/upload-artifact@v2
+        with:
+          name: kotlin-bars.ipa
+          path: ${{ steps.export_archive.outputs.ipa_path }}
+
+      - name: release ipa
+        uses: svenstaro/upload-release-action@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          asset_name: kotlin-bars.ipa
+          file: ${{ steps.export_archive.outputs.ipa_path }}
+          tag: ${{ github.ref }}
+          overwrite: true
+
+      - uses: Apple-Actions/upload-testflight-build@v1
+        with:
+          app-path: ${{ steps.export_archive.outputs.ipa_path }}
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_PRIVATE_KEY }}
